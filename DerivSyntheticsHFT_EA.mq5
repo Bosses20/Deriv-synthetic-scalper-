@@ -66,8 +66,17 @@ sgroup ""
 
 // Trade Execution Settings
 sgroup "Trade Execution"
-extern int MaxOpenTrades_Initial = 1;     // Maximum initial open trades allowed by this EA instance
+extern int MaxOpenTrades_Initial = 1;     // DEPRECATED by MaxPyramidEntries, but kept for now. Will be removed or repurposed.
 extern int SlippagePoints = 10;           // Allowed slippage in points for order execution
+sgroup ""
+
+// Pyramiding Settings
+sgroup "Pyramiding Configuration"
+extern bool EnablePyramiding = true;                // Enable/Disable pyramiding entries
+extern int MaxPyramidEntries = 5;                   // Maximum total entries for one signal sequence (including initial)
+extern int PyramidEntryTriggerPips = 200;           // Points in profit for PREVIOUS trade before adding another (e.g. 2.00 for V50 1s)
+extern ENUM_PYRAMID_LOT_SIZE_MODE PyramidLotSizeMode = LOT_SIZE_MODE_INITIAL_RISK_PERCENT; // How to size lots for pyramid entries
+// extern ENUM_PYRAMID_SL_MANAGEMENT PyramidSLManagement = SL_PER_TRADE; // TODO: Implement SL management for basket
 sgroup ""
 
 
@@ -97,6 +106,22 @@ enum ENUM_TRADE_DIRECTION
    TRADE_DIRECTION_SHORT_ONLY, // Only Short trades
    TRADE_DIRECTION_BOTH         // Both Long and Short trades
   };
+
+enum ENUM_PYRAMID_LOT_SIZE_MODE
+  {
+   LOT_SIZE_MODE_INITIAL_RISK_PERCENT, // Each new entry recalculates lot based on MaxRiskPerTradePercent and its own SL
+   LOT_SIZE_MODE_SAME_AS_FIRST,      // All pyramid entries use the lot size of the very first trade in the sequence
+   LOT_SIZE_MODE_FIXED               // All pyramid entries use the global FixedLotSize input
+  };
+
+/* // TODO for future SL Management for pyramiding
+enum ENUM_PYRAMID_SL_MANAGEMENT
+  {
+   SL_PER_TRADE,          // Each trade in the pyramid has its own independent SL
+   SL_BASKET_BREAKEVEN,   // Move SL of earlier trades to their breakeven when new ones are added
+   SL_BASKET_TRAILING     // Trail the entire basket of trades with one SL
+  };
+*/
 
 //--- Global variables
 CTrade trade; // Instance of the CTrade class for trading operations
@@ -157,6 +182,15 @@ int OnInit()
                   EnumToString(TrendFilter_MA_Method));
      }
    PrintFormat("%s: Trading Direction = %s", expert_name, EnumToString(TradeDirection));
+   PrintFormat("%s: Pyramiding Enabled = %s", expert_name, BoolToString(EnablePyramiding));
+   if(EnablePyramiding)
+     {
+      PrintFormat("%s: Max Pyramid Entries = %d, Trigger Pips = %d, Lot Mode = %s",
+                  expert_name,
+                  MaxPyramidEntries,
+                  PyramidEntryTriggerPips,
+                  EnumToString(PyramidLotSizeMode));
+     }
 
 
 //--- Check for minimum terminal version or other critical settings (optional)
@@ -299,11 +333,12 @@ double CalculateStopLossPips(ENUM_TIMEFRAMES atr_timeframe_param) // Parameter f
 //| Calculate Lot Size                                               |
 //+------------------------------------------------------------------+
 // sl_points is the stop loss distance in points (e.g. for V50, 1 point = $0.05 for 0.05 lot)
-double CalculateLotSize(double sl_points)
+// isPyramidEntry and first_trade_lot are for PyramidLotSizeMode = LOT_SIZE_MODE_SAME_AS_FIRST
+double CalculateLotSize(double sl_points, bool isPyramidEntry = false, double first_trade_lot = 0.0)
   {
-   if(sl_points <= 0)
+   if(sl_points <= 0 && PyramidLotSizeMode != LOT_SIZE_MODE_FIXED && PyramidLotSizeMode != LOT_SIZE_MODE_SAME_AS_FIRST) // Fixed or SameAsFirst might not need SL points if lot is predetermined
      {
-      PrintFormat("%s: SL points must be greater than 0 for lot calculation. SL points: %.2f", expert_name, sl_points);
+      PrintFormat("%s: SL points must be greater than 0 for lot calculation when not using Fixed or SameAsFirst lot mode. SL points: %.2f", expert_name, sl_points);
       return 0.0;
      }
 
@@ -311,13 +346,68 @@ double CalculateLotSize(double sl_points)
    double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double risk_amount = account_balance * (MaxRiskPerTradePercent / 100.0);
 
-   // If FixedLotSize is specified and > 0, use it directly
-   if(FixedLotSize > 0)
+   // Determine lot size based on pyramiding mode if it's a pyramid entry
+   if(isPyramidEntry)
+     {
+      switch(PyramidLotSizeMode)
+        {
+         case LOT_SIZE_MODE_INITIAL_RISK_PERCENT:
+            // Standard calculation below will apply
+            break;
+         case LOT_SIZE_MODE_SAME_AS_FIRST:
+            if(first_trade_lot > 0)
+              {
+               lot_size = first_trade_lot;
+               PrintFormat("%s: Pyramiding: Using same lot as first trade: %.2f", expert_name, lot_size);
+              }
+            else
+              {
+               PrintFormat("%s: Pyramiding: Error - LOT_SIZE_MODE_SAME_AS_FIRST selected but first_trade_lot is 0. Defaulting to risk % calc.", expert_name);
+               // Fallback to initial risk percent calculation
+              }
+            break;
+         case LOT_SIZE_MODE_FIXED:
+            if(FixedLotSize > 0)
+              {
+               lot_size = FixedLotSize;
+               PrintFormat("%s: Pyramiding: Using fixed lot size: %.2f", expert_name, lot_size);
+              }
+            else
+              {
+               PrintFormat("%s: Pyramiding: Error - LOT_SIZE_MODE_FIXED selected but FixedLotSize is 0. Defaulting to risk % calc.", expert_name);
+               // Fallback to initial risk percent calculation
+              }
+            break;
+        }
+      if(lot_size > 0) // If lot size determined by pyramid mode, skip further calculation unless it was a fallback
+        {
+         // Normalize and check min/max for lot_size determined by SAME_AS_FIRST or FIXED
+           lot_size = NormalizeDouble(lot_size, 2);
+           lot_size = MathFloor(lot_size / current_symbol_lot_step) * current_symbol_lot_step;
+           if(lot_size < current_symbol_min_lot) lot_size = current_symbol_min_lot;
+           double max_lot_check = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX);
+           if(lot_size > max_lot_check && max_lot_check > 0) lot_size = max_lot_check;
+           return lot_size;
+        }
+     }
+
+
+   // If FixedLotSize is specified and > 0 (and not overridden by pyramid mode), use it directly
+   if(FixedLotSize > 0 && !isPyramidEntry) // Only for initial trade if fixed lot is used
      {
       lot_size = FixedLotSize;
      }
-   else // Calculate based on risk percentage
+   else if (FixedLotSize > 0 && isPyramidEntry && PyramidLotSizeMode == LOT_SIZE_MODE_FIXED) // Already handled above for pyramid
      {
+       // lot_size already set
+     }
+   else // Calculate based on risk percentage (applies to initial trade, or pyramid if mode is INITIAL_RISK_PERCENT)
+     {
+       if(sl_points <= 0) // Re-check for this path
+        {
+         PrintFormat("%s: SL points must be > 0 for risk %% lot calculation. SL points: %.2f", expert_name, sl_points);
+         return 0.0;
+        }
       // Value per point for 1 lot = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
       // For Deriv Synthetics, SYMBOL_TRADE_TICK_VALUE is often the value of 1 point movement for 1 lot.
       // Example: V50 (1s), SYMBOL_TRADE_TICK_VALUE might be 1.0 (meaning $1 per point for 1 lot).
@@ -348,9 +438,9 @@ double CalculateLotSize(double sl_points)
             lot_size = current_symbol_min_lot;
             // Optional: Add a check here if using min lot still exceeds a hard max risk % (e.g. 10% of account)
             double risk_with_min_lot = (current_symbol_min_lot * sl_points * SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE) / account_balance) * 100.0;
-            PrintFormat("%s: Risk with min lot %.2f is %.2f%%", expert_name, current_symbol_min_lot, risk_with_min_lot);
-            if (risk_with_min_lot > MaxRiskPerTradePercent * 2 && MaxRiskPerTradePercent > 0) { // Example: if it's more than double the desired risk
-                PrintFormat("%s: WARNING! Using min lot results in risk %.2f%%, which significantly exceeds desired %.2f%%. Consider skipping trade or adjusting risk.", expert_name, risk_with_min_lot, MaxRiskPerTradePercent);
+            PrintFormat("%s: Risk with min lot %.2f is %.2f%% (Target was %.2f%%).", expert_name, current_symbol_min_lot, risk_with_min_lot, MaxRiskPerTradePercent);
+            if (risk_with_min_lot > MaxRiskPerTradePercent && MaxRiskPerTradePercent > 0) {
+                PrintFormat("%s: WARNING! Using min lot results in actual risk of %.2f%%, which is different from desired %.2f%%. EA proceeds due to USE_MIN_LOT setting.", expert_name, risk_with_min_lot, MaxRiskPerTradePercent);
             }
             break;
          case LOT_SIZE_BEHAVIOR_SKIP_TRADE:
@@ -465,55 +555,183 @@ struct TradeSignalInfo
 //+------------------------------------------------------------------+
 void CheckForNewTradeSignals()
   {
-   if(!EnableEntry_StructureBreakRetest) return; // Signal disabled
-
    // Ensure we are on M1 timeframe for this specific logic, or adapt if necessary
    if(Period() != PERIOD_M1)
      {
-      // This specific SBR logic is designed for M1.
-      // Could add a check in OnInit or make timeframe an input for SBR.
-      // For now, just return if not on M1.
-      // static bool m1_warning_shown = false;
-      // if(!m1_warning_shown){ PrintFormat("%s: SBR Entry logic is optimized for M1. Current TF: %s", expert_name, EnumToString(Period())); m1_warning_shown = true;}
-      return;
+      // static bool m1_warning_shown_sbr = false; // To show warning only once
+      // if(!m1_warning_shown_sbr && EnableEntry_StructureBreakRetest){ PrintFormat("%s: SBR Entry logic is optimized for M1. Current TF: %s", expert_name, EnumToString(Period())); m1_warning_shown_sbr = true;}
+      // if(EnableEntry_StructureBreakRetest) return; // Only return if SBR is the active logic. Other logic might use other TFs.
      }
 
    ENUM_CURRENT_TREND current_trend = GetCurrentTrend();
    TradeSignalInfo signal; // To store any found signal
+   bool signal_found = false;
+   bool is_pyramid_attempt = false;
+   double first_trade_initial_lot = 0.0; // Needed for LOT_SIZE_MODE_SAME_AS_FIRST
 
-   // Check for Long (Buy) Signal
-   if(TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_LONG_ONLY)
+   int open_trades = CountOpenTrades();
+
+   // --- Initial Entry Logic ---
+   if(open_trades == 0)
      {
-      if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_UP) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode)) // Allow TREND_NONE if not strict
+      if(EnableEntry_StructureBreakRetest) // Check if SBR entry type is enabled
         {
-         if(CheckSBR_Long(signal))
+         // Check for Long (Buy) Signal
+         if(TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_LONG_ONLY)
            {
-            // TODO: Execute Buy Trade using signal details
-            PrintFormat("%s: BUY Signal SBR - Entry:%.5f SL:%.5f TP:%.5f", expert_name, signal.entry_price, signal.stop_loss_price, signal.take_profit_price);
-            ExecuteTrade(signal);
-            return; // Process one signal per tick for now
+            if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_UP) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
+              {
+               if(CheckSBR_Long(signal))
+                 {
+                  signal_found = true;
+                  signal.comment = EA_Comment + " SBR Long Init";
+                 }
+              }
+           }
+         // Check for Short (Sell) Signal
+         if(!signal_found && (TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_SHORT_ONLY))
+           {
+            if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_DOWN) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
+              {
+               if(CheckSBR_Short(signal))
+                 {
+                  signal_found = true;
+                  signal.comment = EA_Comment + " SBR Short Init";
+                 }
+              }
+           }
+        }
+      // Add other initial entry logic types here with `else if(EnableEntry_OtherType)`
+     }
+   // --- Pyramiding Logic ---
+   else if(EnablePyramiding && open_trades > 0 && open_trades < MaxPyramidEntries)
+     {
+      is_pyramid_attempt = true;
+      // Check if the last trade is profitable enough to consider pyramiding
+      long last_ticket = GetLastPositionTicket(first_trade_initial_lot); // Pass by reference to get initial lot
+
+      if(last_ticket != 0)
+        {
+         // Select the position to check its properties
+         if(!PositionSelectByTicket(last_ticket))
+           {
+            PrintFormat("%s: Pyramiding - Failed to select last position ticket %d", expert_name, last_ticket);
+            return;
+           }
+
+         double last_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+         ENUM_POSITION_TYPE last_pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         // double last_trade_volume = PositionGetDouble(POSITION_VOLUME); // Not directly used for trigger profit calc in pips
+
+         bool profit_condition_met = false;
+         double points_in_profit = 0;
+
+         if(last_pos_type == POSITION_TYPE_BUY)
+           {
+            points_in_profit = (SymbolInfoDouble(Symbol(), SYMBOL_BID) - last_open_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+           }
+         else if(last_pos_type == POSITION_TYPE_SELL)
+           {
+            points_in_profit = (last_open_price - SymbolInfoDouble(Symbol(), SYMBOL_ASK)) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+           }
+
+         if(points_in_profit >= PyramidEntryTriggerPips)
+           {
+            profit_condition_met = true;
+           }
+
+         if(profit_condition_met)
+           {
+            PrintFormat("%s: Pyramiding condition met. Last trade %.0f points in profit.", expert_name, points_in_profit);
+            // Check SBR again for continuation, or a simpler continuation signal
+            if(EnableEntry_StructureBreakRetest) // Re-using SBR for pyramid entry for now
+              {
+               if(last_pos_type == POSITION_TYPE_BUY && (TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_LONG_ONLY))
+                 {
+                  if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_UP) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
+                    {
+                     if(CheckSBR_Long(signal))
+                       {
+                        signal_found = true;
+                        signal.comment = EA_Comment + " SBR Long Pyr " + IntegerToString(open_trades + 1);
+                       }
+                    }
+                 }
+               else if(last_pos_type == POSITION_TYPE_SELL && (TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_SHORT_ONLY))
+                 {
+                  if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_DOWN) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
+                    {
+                     if(CheckSBR_Short(signal))
+                       {
+                        signal_found = true;
+                        signal.comment = EA_Comment + " SBR Short Pyr " + IntegerToString(open_trades + 1);
+                       }
+                    }
+                 }
+              }
+            // Potentially add other pyramid entry signal logic here
            }
         }
      }
 
-   // Check for Short (Sell) Signal
-   if(TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_SHORT_ONLY)
+   if(signal_found)
      {
-      if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_DOWN) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode)) // Allow TREND_NONE if not strict
-        {
-         if(CheckSBR_Short(signal))
-           {
-            // TODO: Execute Sell Trade using signal details
-            PrintFormat("%s: SELL Signal SBR - Entry:%.5f SL:%.5f TP:%.5f", expert_name, signal.entry_price, signal.stop_loss_price, signal.take_profit_price);
-            ExecuteTrade(signal);
-            return; // Process one signal per tick for now
-           }
-        }
+      PrintFormat("%s: %s Signal - Entry:%.5f SL:%.5f TP:%.5f. Comment: %s",
+                  expert_name,
+                  (signal.signal_type == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+                  signal.entry_price, signal.stop_loss_price, signal.take_profit_price, signal.comment);
+
+      // Pass isPyramidAttempt and first_trade_initial_lot to ExecuteTrade, which will pass it to CalculateLotSize
+      ExecuteTrade(signal, is_pyramid_attempt, (open_trades == 0 ? 0.0 : first_trade_initial_lot) );
      }
   }
 
 // Placeholder for strict trend mode - if true, TREND_NONE would not allow trades
 static bool strict_trend_mode = false; // Can be made an input parameter
+
+//+------------------------------------------------------------------+
+//| Get Last Position Ticket for the current symbol and magic number |
+//| Also retrieves the lot size of the first trade in a sequence.    |
+//+------------------------------------------------------------------+
+long GetLastPositionTicket(double &initial_lot_size_out) // Pass by reference
+  {
+   long last_ticket = 0;
+   datetime last_open_time = 0;
+
+   long first_ticket_in_sequence = 0;
+   datetime first_open_time_in_sequence = DBL_MAX; // Initialize with a large value
+
+   initial_lot_size_out = 0.0; // Default
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetSymbol(i) == Symbol() && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+        {
+         datetime current_pos_time = PositionGetInteger(POSITION_TIME);
+         if(current_pos_time > last_open_time)
+           {
+            last_open_time = current_pos_time;
+            last_ticket = PositionGetTicket(i);
+           }
+         if(current_pos_time < first_open_time_in_sequence)
+           {
+            first_open_time_in_sequence = current_pos_time;
+            first_ticket_in_sequence = PositionGetTicket(i);
+           }
+        }
+     }
+
+   // If a first ticket was found, get its lot size
+   if(first_ticket_in_sequence != 0)
+     {
+      if(PositionSelectByTicket(first_ticket_in_sequence))
+        {
+         initial_lot_size_out = PositionGetDouble(POSITION_VOLUME);
+        }
+     }
+
+   return last_ticket;
+  }
 
 //+------------------------------------------------------------------+
 //| Check for Structure Break & Retest - LONG SIGNAL                 |
@@ -693,39 +911,51 @@ bool CheckSBR_Short(TradeSignalInfo &signal_out)
 //+------------------------------------------------------------------+
 //| Execute Trade                                                    |
 //+------------------------------------------------------------------+
-void ExecuteTrade(TradeSignalInfo &signal)
+void ExecuteTrade(TradeSignalInfo &signal, bool isPyramid = false, double firstTradeLot = 0.0)
   {
 //--- Check if max open trades limit reached
-   if(CountOpenTrades() >= MaxOpenTrades_Initial)
+   // Use MaxPyramidEntries if pyramiding is enabled, otherwise MaxOpenTrades_Initial (which is likely 1)
+   int max_trades_allowed = EnablePyramiding ? MaxPyramidEntries : MaxOpenTrades_Initial;
+   if(CountOpenTrades() >= max_trades_allowed)
      {
-      PrintFormat("%s: Max open trades limit (%d) reached. No new trade.", expert_name, MaxOpenTrades_Initial);
+      PrintFormat("%s: Max open trades limit (%d) reached. No new trade.", expert_name, max_trades_allowed);
       return;
      }
 
 //--- Calculate Lot Size
-   // SL distance in points for lot calculation:
-   double sl_distance_points = MathAbs(signal.entry_price - signal.stop_loss_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-   if(signal.signal_type == ORDER_TYPE_SELL) // For sells, entry is Bid, SL is above
+   double sl_distance_points = 0;
+   // For pyramid entries with fixed lot or same as first, SL distance isn't strictly needed for lot calc, but good for record
+   if(isPyramid && (PyramidLotSizeMode == LOT_SIZE_MODE_FIXED || PyramidLotSizeMode == LOT_SIZE_MODE_SAME_AS_FIRST))
      {
-      sl_distance_points = MathAbs(signal.stop_loss_price - SymbolInfoDouble(Symbol(), SYMBOL_BID)) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-      // Ensure SL is calculated from current market, not theoretical entry if signal is old
+       // SL distance is still relevant for the trade itself, even if not for lot sizing here.
+       // The SL for a pyramid entry is determined by its own new signal (e.g. SBR re-evaluation).
+       // signal.stop_loss_price should be set correctly by CheckSBR_Long/Short.
+        sl_distance_points = MathAbs(signal.entry_price - signal.stop_loss_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT); // Based on signal's own SL
      }
-   else // For buys, entry is Ask, SL is below
+   else // For initial trades or pyramid entries using risk %
      {
-      sl_distance_points = MathAbs(SymbolInfoDouble(Symbol(), SYMBOL_ASK) - signal.stop_loss_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+       // SL distance in points for lot calculation:
+       if(signal.signal_type == ORDER_TYPE_SELL) // For sells, entry is Bid, SL is above
+         {
+          sl_distance_points = MathAbs(signal.stop_loss_price - SymbolInfoDouble(Symbol(), SYMBOL_BID)) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+         }
+       else // For buys, entry is Ask, SL is below
+         {
+          sl_distance_points = MathAbs(SymbolInfoDouble(Symbol(), SYMBOL_ASK) - signal.stop_loss_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+         }
+
+       if(sl_distance_points < SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) && SL_Method != SL_METHOD_FIXED_PIPS) // If ATR SL is too small (compare points to points)
+         {
+           sl_distance_points = SL_FixedPips; // Fallback to fixed pips SL if ATR is smaller than stops level
+           PrintFormat("%s: Calculated SL distance (%.0f points) is too small. Using fixed SL of %d points for lot calculation.", expert_name, sl_distance_points, SL_FixedPips);
+         }
      }
 
-   if(sl_distance_points < SymbolInfoDouble(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(Symbol(), SYMBOL_POINT) && SL_Method != SL_METHOD_FIXED_PIPS) // If ATR SL is too small
-     {
-       sl_distance_points = SL_FixedPips; // Fallback to fixed pips SL if ATR is smaller than stops level
-       PrintFormat("%s: Calculated SL distance (%.2f points) is too small. Using fixed SL of %.0f points for lot calculation.", expert_name, sl_distance_points, (double)SL_FixedPips);
-     }
 
-
-   double lot_size = CalculateLotSize(sl_distance_points);
+   double lot_size = CalculateLotSize(sl_distance_points, isPyramid, firstTradeLot);
    if(lot_size <= 0.0)
      {
-      PrintFormat("%s: Lot size calculation failed or returned 0. Cannot execute trade.", expert_name);
+      PrintFormat("%s: Lot size calculation failed or returned 0 for %s. Cannot execute trade.", expert_name, signal.comment);
       return;
      }
 
