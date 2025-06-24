@@ -77,6 +77,13 @@ extern int MaxPyramidEntries = 5;                   // Maximum total entries for
 extern int PyramidEntryTriggerPips = 200;           // Points in profit for PREVIOUS trade before adding another (e.g. 2.00 for V50 1s)
 extern ENUM_PYRAMID_LOT_SIZE_MODE PyramidLotSizeMode = LOT_SIZE_MODE_INITIAL_RISK_PERCENT; // How to size lots for pyramid entries
 // extern ENUM_PYRAMID_SL_MANAGEMENT PyramidSLManagement = SL_PER_TRADE; // TODO: Implement SL management for basket
+
+// Continuation Signal Settings (for Pyramiding)
+extern bool PyramidUseContinuationSignal = true;      // Use simpler continuation logic for pyramid entries instead of full SBR
+extern int ContinuationMAPeriod = 9;                  // MA Period for M1 continuation signal (e.g., 9 EMA)
+extern ENUM_MA_METHOD ContinuationMA_Method = MODE_EMA; // MA Method for continuation signal
+extern int ContinuationEntryOffsetPoints = 50;        // Points beyond MA for entry confirmation (e.g., 0.050 for V50 1s)
+extern int ContinuationSLPlacementPoints = 150;       // SL distance in points from pullback candle's extreme (e.g., 0.150 for V50 1s)
 sgroup ""
 
 
@@ -190,6 +197,16 @@ int OnInit()
                   MaxPyramidEntries,
                   PyramidEntryTriggerPips,
                   EnumToString(PyramidLotSizeMode));
+      PrintFormat("%s: Pyramid Use Continuation Signal = %s", expert_name, BoolToString(PyramidUseContinuationSignal));
+      if(PyramidUseContinuationSignal)
+        {
+         PrintFormat("%s: Continuation MA Period = %d, Method = %s, Entry Offset = %d pts, SL Placement = %d pts",
+                     expert_name,
+                     ContinuationMAPeriod,
+                     EnumToString(ContinuationMA_Method),
+                     ContinuationEntryOffsetPoints,
+                     ContinuationSLPlacementPoints);
+        }
      }
 
 
@@ -643,9 +660,40 @@ void CheckForNewTradeSignals()
          if(profit_condition_met)
            {
             PrintFormat("%s: Pyramiding condition met. Last trade %.0f points in profit.", expert_name, points_in_profit);
-            // Check SBR again for continuation, or a simpler continuation signal
-            if(EnableEntry_StructureBreakRetest) // Re-using SBR for pyramid entry for now
+
+            bool pyramid_signal_sought = false;
+
+            if(PyramidUseContinuationSignal)
               {
+               pyramid_signal_sought = true;
+               if(last_pos_type == POSITION_TYPE_BUY && (TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_LONG_ONLY))
+                 {
+                  if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_UP) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
+                    {
+                     if(CheckContinuationSignal_Long(signal))
+                       {
+                        signal_found = true;
+                        signal.comment = EA_Comment + " Cont. Long Pyr " + IntegerToString(open_trades + 1);
+                       }
+                    }
+                 }
+               else if(last_pos_type == POSITION_TYPE_SELL && (TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_SHORT_ONLY))
+                 {
+                  if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_DOWN) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
+                    {
+                     if(CheckContinuationSignal_Short(signal))
+                       {
+                        signal_found = true;
+                        signal.comment = EA_Comment + " Cont. Short Pyr " + IntegerToString(open_trades + 1);
+                       }
+                    }
+                 }
+              }
+
+            // Fallback to SBR if continuation signal is not used or not found, and SBR is enabled
+            if(!signal_found && EnableEntry_StructureBreakRetest && (!pyramid_signal_sought || !PyramidUseContinuationSignal))
+              {
+               PrintFormat("%s: Pyramiding: Continuation signal not found or not used, trying SBR.", expert_name);
                if(last_pos_type == POSITION_TYPE_BUY && (TradeDirection == TRADE_DIRECTION_BOTH || TradeDirection == TRADE_DIRECTION_LONG_ONLY))
                  {
                   if(!EnableTrendFilter || (EnableTrendFilter && current_trend == TREND_UP) || (EnableTrendFilter && current_trend == TREND_NONE && !strict_trend_mode))
@@ -669,7 +717,6 @@ void CheckForNewTradeSignals()
                     }
                  }
               }
-            // Potentially add other pyramid entry signal logic here
            }
         }
      }
@@ -830,6 +877,111 @@ bool CheckSBR_Long(TradeSignalInfo &signal_out)
            }
        }
    }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Check for M1 MA Continuation Signal - LONG                       |
+//+------------------------------------------------------------------+
+bool CheckContinuationSignal_Long(TradeSignalInfo &signal_out)
+  {
+   if(Period() != PERIOD_M1) return false; // This logic is for M1
+
+   MqlRates m1_rates[];
+   if(CopyRates(Symbol(), PERIOD_M1, 0, 3, m1_rates) < 3) // Need at least 2-3 bars
+     {
+      PrintFormat("%s: Conti_Long - Not enough M1 bars.", expert_name);
+      return false;
+     }
+   ArraySetAsSeries(m1_rates, true); // 0 is current, 1 is previous closed, 2 is one before that
+
+   double ma_values[];
+   if(CopyBuffer(iMA(Symbol(), PERIOD_M1, ContinuationMAPeriod, 0, ContinuationMA_Method, PRICE_CLOSE), 0, 0, 3, ma_values) < 3)
+     {
+      PrintFormat("%s: Conti_Long - Error copying Continuation MA buffer.", expert_name);
+      return false;
+     }
+   ArraySetAsSeries(ma_values, true);
+
+   // Check bar 1 (last closed bar) for pullback and confirmation
+   // Pullback: low of bar 1 touched or went below MA
+   bool pullback_occurred = m1_rates[1].low <= ma_values[1];
+   // Confirmation: close of bar 1 is above MA
+   bool confirmation_candle = m1_rates[1].close > ma_values[1];
+   // Optional: entry trigger - current price (ask) is already X points above MA
+   bool entry_trigger = SymbolInfoDouble(Symbol(), SYMBOL_ASK) > ma_values[0] + ContinuationEntryOffsetPoints * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+
+
+   if(pullback_occurred && confirmation_candle && entry_trigger)
+     {
+      // Ensure the MA itself is generally sloping up or flat (optional, advanced)
+      // if(ma_values[0] < ma_values[1] && ma_values[1] < ma_values[2]) return false; // MA sloping down
+
+      signal_out.signal_type = ORDER_TYPE_BUY;
+      signal_out.entry_price = SymbolInfoDouble(Symbol(), SYMBOL_ASK); // Market entry
+
+      // SL below the low of the confirmation candle (bar 1) by ContinuationSLPlacementPoints
+      signal_out.stop_loss_price = m1_rates[1].low - ContinuationSLPlacementPoints * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+      signal_out.stop_loss_price = NormalizeDouble(signal_out.stop_loss_price, current_symbol_digits);
+
+      double sl_dist_points = MathAbs(signal_out.entry_price - signal_out.stop_loss_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+      double tp_points_calc = CalculateTakeProfitPips(sl_dist_points);
+      signal_out.take_profit_price = signal_out.entry_price + tp_points_calc * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+      signal_out.take_profit_price = NormalizeDouble(signal_out.take_profit_price, current_symbol_digits);
+
+      // signal_out.comment set by caller
+      PrintFormat("%s: Continuation LONG signal found. Entry: %.5f, SL: %.5f, TP: %.5f", expert_name, signal_out.entry_price, signal_out.stop_loss_price, signal_out.take_profit_price);
+      return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Check for M1 MA Continuation Signal - SHORT                      |
+//+------------------------------------------------------------------+
+bool CheckContinuationSignal_Short(TradeSignalInfo &signal_out)
+  {
+   if(Period() != PERIOD_M1) return false;
+
+   MqlRates m1_rates[];
+   if(CopyRates(Symbol(), PERIOD_M1, 0, 3, m1_rates) < 3)
+     {
+      PrintFormat("%s: Conti_Short - Not enough M1 bars.", expert_name);
+      return false;
+     }
+   ArraySetAsSeries(m1_rates, true);
+
+   double ma_values[];
+   if(CopyBuffer(iMA(Symbol(), PERIOD_M1, ContinuationMAPeriod, 0, ContinuationMA_Method, PRICE_CLOSE), 0, 0, 3, ma_values) < 3)
+     {
+      PrintFormat("%s: Conti_Short - Error copying Continuation MA buffer.", expert_name);
+      return false;
+     }
+   ArraySetAsSeries(ma_values, true);
+
+   bool pullback_occurred = m1_rates[1].high >= ma_values[1];
+   bool confirmation_candle = m1_rates[1].close < ma_values[1];
+   bool entry_trigger = SymbolInfoDouble(Symbol(), SYMBOL_BID) < ma_values[0] - ContinuationEntryOffsetPoints * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+
+   if(pullback_occurred && confirmation_candle && entry_trigger)
+     {
+      // Optional: Ensure MA is sloping down or flat
+      // if(ma_values[0] > ma_values[1] && ma_values[1] > ma_values[2]) return false; // MA sloping up
+
+      signal_out.signal_type = ORDER_TYPE_SELL;
+      signal_out.entry_price = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+
+      signal_out.stop_loss_price = m1_rates[1].high + ContinuationSLPlacementPoints * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+      signal_out.stop_loss_price = NormalizeDouble(signal_out.stop_loss_price, current_symbol_digits);
+
+      double sl_dist_points = MathAbs(signal_out.entry_price - signal_out.stop_loss_price) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+      double tp_points_calc = CalculateTakeProfitPips(sl_dist_points);
+      signal_out.take_profit_price = signal_out.entry_price - tp_points_calc * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+      signal_out.take_profit_price = NormalizeDouble(signal_out.take_profit_price, current_symbol_digits);
+
+      PrintFormat("%s: Continuation SHORT signal found. Entry: %.5f, SL: %.5f, TP: %.5f", expert_name, signal_out.entry_price, signal_out.stop_loss_price, signal_out.take_profit_price);
+      return true;
+     }
    return false;
   }
 
